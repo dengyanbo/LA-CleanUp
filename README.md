@@ -62,13 +62,105 @@ Only review always-failing apps:
 .\Invoke-LogicAppCleanup.ps1 -SkipIdle
 ```
 
-## Notes & limitations
+## How it works (technical deep dive)
 
-- **Per-item confirmation** is the only safety net. There is no `-WhatIf` and no `-Force`. If you need a dry run, answer `N` to every delete prompt — the report and CSV are still produced.
-- **API connections** (`Microsoft.Web/connections`) referenced by the deleted workflows are **not** removed by this script (they are often shared). Clean them up separately if needed.
-- The script uses the Logic Apps Management REST API (`api-version=2016-06-01`) via `az rest`, so the `az logic` extension is **not** required.
-- Run history is queried with server-side `$filter` on `startTime` / `status`, so it is efficient even for chatty workflows.
-- Deletion uses `az resource delete --ids <resourceId>`. Workflow run history is removed by Azure when the workflow itself is deleted.
+A few engineering decisions in the script meaningfully affect correctness and performance. They're worth calling out in case you're adapting the script or just curious.
+
+### 1. Enumeration via `az resource list`, not `az logic`
+
+```powershell
+az resource list --resource-type Microsoft.Logic/workflows -o json
+```
+
+A generic ARM list is used instead of the `az logic` extension because:
+
+- It avoids depending on an extension that's marked Preview on some installations.
+- One ARM call returns `id`, `name`, `resourceGroup`, and `location` for every Consumption workflow in the active subscription.
+- `properties.state` (Enabled/Disabled) is **not** in that projection. The script fetches it lazily with `az resource show --query properties.state` only for workflows that become candidates. On a subscription with hundreds of workflows but only a handful of candidates, that's an order of magnitude fewer ARM calls than `show`-ing every one.
+
+### 2. Server-side `$filter` on run history
+
+For each surviving workflow the script asks two questions of the Logic Apps Management REST API (`api-version=2016-06-01`):
+
+```
+GET /subscriptions/.../workflows/{wf}/runs
+    ?api-version=2016-06-01
+    &$top=1
+    &$filter=startTime ge 2026-02-18T02:20:00Z
+```
+
+and
+
+```
+GET .../runs
+    ?api-version=2016-06-01
+    &$top=1
+    &$filter=startTime ge 2026-02-18T02:20:00Z and status eq 'Succeeded'
+```
+
+`$top=1` is the important bit — we never need to page run history, only check **existence**. Even on a chatty workflow with thousands of runs in the window the server still answers in O(1) because the filter is indexed.
+
+### 3. Bearer-token caching instead of `az rest`
+
+The script calls `Invoke-RestMethod` with a bearer token cached on `$script:ArmToken`, refreshed proactively at 45 minutes (ARM tokens last ~60). It does **not** use `az rest`. Why:
+
+On **Windows PowerShell**, `az` is a `.cmd` shim, so the URL passed to `az rest --uri "..."` is re-parsed by `cmd.exe`. The `&` characters separating OData query parameters (`$top=1&$filter=...`) get split into multiple commands. Symptoms range from `'$filter' is not recognized as an internal or external command` to silent wrong-page returns. Quoting heroics don't fully solve it.
+
+Switching to:
+
+```powershell
+$tok = az account get-access-token --resource 'https://management.azure.com/' -o json | ConvertFrom-Json
+Invoke-RestMethod -Method Get -Uri $url -Headers @{ Authorization = "Bearer $($tok.accessToken)" }
+```
+
+bypasses the shell entirely. Bonus: caching the token makes the script noticeably faster on subscriptions with many candidates, since we're no longer shelling out for every REST call.
+
+### 4. Lazy `State` fetch
+
+`State` (Enabled/Disabled) is only fetched for workflows that end up as candidates, never for healthy ones. Same principle as the lazy enumeration above — don't pay for data you don't show.
+
+### 5. CSV as audit trail
+
+`LogicAppCleanup-Candidates-<yyyyMMdd-HHmmss>.csv` is written next to the script when you answer `y` to the export prompt. Columns are stable and grep-friendly:
+
+```
+Category, Name, ResourceGroup, Location, State, LastStatus, LastRunTime, ResourceId
+```
+
+The `ResourceId` column makes it trivial to feed a CSV back into a different deletion pipeline (`az resource delete --ids ...`) or to diff two runs week-over-week.
+
+### 6. Deletion semantics
+
+Deletion uses:
+
+```powershell
+az resource delete --ids $c.ResourceId
+```
+
+Workflow **run history is removed by Azure automatically** when the workflow itself is deleted — no separate purge call is needed. The script does **not** delete `Microsoft.Web/connections` referenced by the workflow definition (see considerations below).
+
+## Considerations and limitations
+
+These are deliberate scope decisions, not bugs. Read them before running the script in a subscription you don't fully own.
+
+- **Per-item confirmation is the only safety net.** There is no `-WhatIf` and no `-Force`. If you want a dry run, answer `N` to every delete prompt — the report and CSV are still produced.
+- **Consumption only.** Logic Apps **Standard** workflows live inside an App Service (`Microsoft.Web/sites` with `kind=workflowapp`) and store run history in storage tables, not in the management plane. This script does not handle them. For Standard, see tools like [`LogicAppAdvancedTool`](https://github.com/Azure/logicappadvancedtool).
+- **Permissions.** You need to be able to **list** and **delete** workflows — `Contributor` on the relevant resource groups, or `Logic App Contributor`, both work. `az account get-access-token` only needs the standard ARM scope your `az login` already granted.
+- **API connections are not removed.** `Microsoft.Web/connections` referenced via `parameters.$connections` in the workflow definition are usually shared. Deleting them blindly when their last consumer goes away is dangerous, so the script leaves them alone. GC them with a separate pass.
+- **Enabled vs. Disabled is reported, not enforced.** A `Disabled` workflow can still be Idle (no runs ever or no runs in the window). The script shows the state in the table so you can decide; it does not soft-action Disabled workflows.
+- **"AlwaysFailing" means "no `Succeeded` in the window".** Workflows whose runs are `Running`, `Waiting`, or `Cancelled` but never `Succeeded` will be classified as AlwaysFailing. That's usually what you want, but slow workflows that legitimately haven't completed yet look the same — widen `-FailureWindowDays` for those.
+- **Run history is gone after deletion.** Once a workflow is deleted you can't browse its history in the portal. The CSV is your audit trail. Keep it.
+- **Single subscription per invocation.** The script operates on the **active** subscription only — it does not enumerate all subscriptions you have access to. Use `az account set --subscription <id>` to switch, deliberately.
+
+## Field-tested safety pattern
+
+If you're running this on a subscription you don't fully own, this rollout has worked well:
+
+1. Run with `-SkipAlwaysFailing` first. Idle workflows are the safe pile — they haven't done anything in 90+ days, so deleting them rarely surprises anyone.
+2. Export the CSV. Don't delete yet — answer `q` at the first delete prompt.
+3. Drop the CSV in a Teams channel or PR. Give owners a few days to object.
+4. Re-run and actually delete the ones nobody claimed.
+5. *Then* run with `-SkipIdle` for the AlwaysFailing bucket. These often have an owner who just hasn't noticed the breakage — treat the first pass as a bug-bash list, not a delete list.
 
 ## CSV format
 
