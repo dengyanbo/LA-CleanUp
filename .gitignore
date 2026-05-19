@@ -1,2 +1,5 @@
 # Output of the cleanup script — contains subscription / resource IDs
 LogicAppCleanup-Candidates-*.csv
+
+# Draft blog post — kept local, not published via the repo
+blog-azure-tech-community.md
